@@ -3,6 +3,12 @@
 //! This module provides secure storage for OAuth2 tokens (access and refresh tokens)
 //! using the system's native credential store (Keychain on macOS, Credential Manager
 //! on Windows, Secret Service on Linux).
+//!
+//! When the keyring is unavailable (e.g. no D-Bus session inside a container or
+//! devcontainer bootstrap subprocess), token retrieval returns `None` so that the
+//! caller falls back to a fresh OAuth2 flow.  Token storage failures are logged as
+//! warnings but do not abort the operation — the freshly-obtained token is still
+//! returned to the caller for this invocation.
 
 use crate::error::{CredentialError, Result};
 use chrono::{DateTime, Utc};
@@ -81,7 +87,12 @@ impl TokenStore {
         })
     }
 
-    /// Store a token in the system keyring
+    /// Store a token in the system keyring.
+    ///
+    /// If the keyring is unavailable (e.g. no D-Bus session) the failure is
+    /// logged as a warning and the function returns `Ok(())` so that the
+    /// freshly-obtained token can still be returned to the Docker/Podman caller
+    /// for this invocation.  The next invocation will simply perform OAuth again.
     pub fn store_token(&self, token: &StoredToken) -> Result<()> {
         info!("Storing tokens for registry: {}", self.registry);
 
@@ -96,37 +107,42 @@ impl TokenStore {
 
         // Store access token
         let access_entry = self.get_access_token_entry()?;
-        access_entry
-            .set_secret(token.access_token.as_bytes())
-            .map_err(|e| {
-                CredentialError::TokenStoreError(format!("Failed to store access token: {}", e))
-            })?;
+        if let Err(e) = access_entry.set_secret(token.access_token.as_bytes()) {
+            warn!(
+                "Failed to store access token in keyring (keyring unavailable?): {}",
+                e
+            );
+            // Cannot persist the token this invocation, but don't fail — the
+            // caller still has a valid token to return.
+            return Ok(());
+        }
 
         // Store refresh token
         if let Some(ref refresh_token) = token.refresh_token {
             let refresh_entry = self.get_refresh_token_entry()?;
-            refresh_entry
-                .set_secret(refresh_token.as_bytes())
-                .map_err(|e| {
-                    CredentialError::TokenStoreError(format!(
-                        "Failed to store refresh token: {}",
-                        e
-                    ))
-                })?;
+            if let Err(e) = refresh_entry.set_secret(refresh_token.as_bytes()) {
+                warn!("Failed to store refresh token in keyring: {}", e);
+            }
         }
 
         // Store expiration time
         let expires_rfc3339 = token.expires_at.to_rfc3339();
         let expires_entry = self.get_expiration_entry()?;
-        expires_entry.set_password(&expires_rfc3339).map_err(|e| {
-            CredentialError::TokenStoreError(format!("Failed to store expiration: {}", e))
-        })?;
+        if let Err(e) = expires_entry.set_password(&expires_rfc3339) {
+            warn!("Failed to store token expiration in keyring: {}", e);
+        }
+
         info!("Tokens stored successfully for registry: {}", self.registry);
         info!("Token expires at: {}", token.expires_at);
         Ok(())
     }
 
-    /// Retrieve a token from the system keyring
+    /// Retrieve a token from the system keyring.
+    ///
+    /// Returns `Ok(None)` — rather than an error — when the keyring is
+    /// unavailable due to a platform error (e.g. D-Bus not reachable inside a
+    /// container).  This allows the caller to fall back to a fresh OAuth2 flow
+    /// instead of terminating with an error.
     pub fn get_token(&self) -> Result<Option<StoredToken>> {
         debug!(
             "Attempting to retrieve token for registry: {}",
@@ -153,11 +169,13 @@ impl TokenStore {
                 return Ok(None);
             }
             Err(e) => {
-                warn!("Failed to retrieve access token from keyring: {}", e);
-                return Err(CredentialError::TokenStoreError(format!(
-                    "Failed to retrieve access token: {}",
+                // Platform error (e.g. D-Bus unavailable): treat as cache miss
+                // so the caller proceeds with a fresh OAuth2 flow.
+                warn!(
+                    "Keyring read failed ({}); treating as cache miss, will re-authenticate",
                     e
-                )));
+                );
+                return Ok(None);
             }
         };
 
@@ -207,10 +225,7 @@ impl TokenStore {
             }
             Err(e) => {
                 warn!("Failed to retrieve expiration from keyring: {}", e);
-                return Err(CredentialError::TokenStoreError(format!(
-                    "Failed to retrieve expiration: {}",
-                    e
-                )));
+                return Ok(None);
             }
         };
 

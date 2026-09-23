@@ -1,6 +1,6 @@
 [package]
 name = "docker-credential-icr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Philipp Wagner"]
 description = "Docker credential helper for IBM Cloud Container Registry using OAuth2"
